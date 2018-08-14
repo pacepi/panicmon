@@ -3,7 +3,6 @@
 #include <linux/init.h>
 #include <linux/net.h>
 #include <net/sock.h>
-#include <linux/tcp.h>
 #include <linux/in.h>
 #include <asm/uaccess.h>
 #include <linux/socket.h>
@@ -15,7 +14,7 @@
 static char *desturi = NULL;
 module_param(desturi, charp, S_IRUSR | S_IWUSR);
 MODULE_PARM_DESC(desturi, "destination URI, multi URIs "
-	"should be seprated by ,\n");
+		"should be seprated by ,\n");
 
 
 #define PORT 7
@@ -36,6 +35,52 @@ u32 create_address(u8 *ip)
 	return addr;
 }
 
+size_t dump_kmsg(char *buf, size_t size)
+{
+	struct file *fkmsg = NULL;
+	size_t ret = 0;
+	size_t remain = size;
+	size_t total = 0;
+
+	pr_emerg("trigger dump kmsg from panic, max size = %ld\n", size);
+	if (buf == NULL) {
+		pr_emerg("vmalloc fail\n");
+		goto out;
+	}
+
+	fkmsg = filp_open("/dev/kmsg", O_RDONLY | O_NONBLOCK, 0600);
+	if (fkmsg == NULL) {
+		pr_emerg("open /dev/ksmg fail\n");
+		goto close_fkmsg;
+	}
+
+	//pr_emerg("start dump kmsg ...\n");
+	fkmsg->f_pos = 0;
+	while (1) {
+		ret = kernel_read(fkmsg, buf, remain, &fkmsg->f_pos);
+		printk("kernel_read ret = %d\n", ret);
+		if (ret > 0) {
+			buf += ret;
+			remain -= ret;
+			total += ret;
+			if (total >= size) {
+				printk("kernel_read ret = %d, remain = %ld, total = %ld\n", ret, remain, total);
+				break;
+			}
+		} else {
+			printk("kernel_read ret = %d, break loop\n", ret);
+			break;
+		}
+	}
+	pr_emerg("finish dump kmsg. total = %ld\n", total);
+
+close_fkmsg:
+	if (fkmsg)
+		filp_close(fkmsg, NULL);
+
+out:
+	return total;
+}
 
 int sock_send(struct socket *sock, char *buf, size_t length, unsigned long flags)
 {
@@ -76,16 +121,23 @@ repeat_send:
 }
 
 
-static int __tcp_sendto_uri(char *msg)
+static int __udp_sendto_uri(char *msg)
 {
-	struct socket *tcp_socket = NULL;
+	struct socket *udp_socket = NULL;
 	struct sockaddr_in saddr;
 	unsigned char destip[5] = {192, 168, 56, 102, '\0'};
-	char *reply = kmalloc(4096, GFP_KERNEL);
 	int ret = -1;
+	unsigned int bufsize = 64*1024 - 8 - 20 - 22;
+	char *sendbuf = NULL;
 
-	//ret = sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP, &tcp_socket);
-	ret = sock_create(PF_INET, SOCK_DGRAM, IPPROTO_UDP, &tcp_socket);
+	sendbuf = vmalloc(bufsize);
+	if (sendbuf == NULL) {
+		pr_err("%s vmalloc error\n", MODULENAME);
+		bufsize = 0;
+	}
+
+	//ret = sock_create(PF_INET, SOCK_STREAM, IPPROTO_udp, &udp_socket);
+	ret = sock_create(PF_INET, SOCK_DGRAM, IPPROTO_UDP, &udp_socket);
 	if(ret < 0) {
 		pr_err("%s sock_create error, ret = %d\n", MODULENAME, ret);
 		goto out;
@@ -96,19 +148,38 @@ static int __tcp_sendto_uri(char *msg)
 	saddr.sin_port = htons(PORT);
 	saddr.sin_addr.s_addr = htonl(create_address(destip));
 
-	ret = tcp_socket->ops->connect(tcp_socket, (struct sockaddr *)&saddr,
+	ret = udp_socket->ops->connect(udp_socket, (struct sockaddr *)&saddr,
 			sizeof(saddr), O_RDWR);
 	if(ret) {
 		pr_err("%s sock connect error, ret = %d\n", MODULENAME, ret);
 		goto release_sock;
 	}
 
-	sock_send(tcp_socket, msg, strlen(msg), MSG_DONTWAIT);
+	if (bufsize > 0) {
+		unsigned long len = 0;
+		memset(sendbuf, 0x00, bufsize);
+		strcat(sendbuf, "REASON:");
+		strcat(sendbuf, msg);
+		strcat(sendbuf, "\r\n");
+		strcat(sendbuf, "KMSG:");
+
+		len = strlen(sendbuf);
+		dump_kmsg(sendbuf + len, bufsize - len - 1);
+		sendbuf[bufsize - 1] = '\0';
+		sock_send(udp_socket, sendbuf, strlen(sendbuf), MSG_DONTWAIT);
+	} else {
+		sock_send(udp_socket, msg, strlen(msg), MSG_DONTWAIT);
+	}
+
+	if (sendbuf) {
+		vfree(sendbuf);
+		sendbuf = NULL;
+	}
 
 release_sock:
-	if(tcp_socket != NULL) {
-		sock_release(tcp_socket);
-		tcp_socket = NULL;
+	if(udp_socket != NULL) {
+		sock_release(udp_socket);
+		udp_socket = NULL;
 	}
 
 out :
@@ -116,9 +187,9 @@ out :
 }
 
 static int panicmon_notify(struct notifier_block *nb, unsigned long code, 
-	void *unused)
+		void *unused)
 {
-	__tcp_sendto_uri("panic");
+	__udp_sendto_uri(unused);
 	return NOTIFY_DONE;
 }
 
@@ -133,6 +204,7 @@ static int __init panicmon_init(void)
 {
 	pr_info("%s init\n", MODULENAME);
 	atomic_notifier_chain_register(&panic_notifier_list, &panicmon_nb);
+	__udp_sendto_uri("init");
 
 	return 0;
 }
